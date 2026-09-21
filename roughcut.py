@@ -160,6 +160,85 @@ def keeps_from(removals: list[Removal], duration: float) -> list[tuple[float, fl
     return keeps
 
 
+def render_speed_silence(src: Path, removals: list["Removal"], duration: float, dst: Path,
+                         crf: int, speed: float, silence_speed: float) -> None:
+    """Не вырезать паузу, а ПРОЛЕТЕТЬ её.
+
+    Идея подсмотрена у OpenMontage (AGPL) — но только идея: код здесь свой, три строки фильтра.
+    Склейки не видно вовсе, потому что её нет: пауза остаётся, просто идёт в несколько раз
+    быстрее. Для кадра, где человек в паузе меняет позу, это честнее джамп-ката.
+
+    Видео каждого куска получает свой `setpts`, звук — `atempo`. Ускорение тишины бывает больше
+    2,0, которые `atempo` принимает за раз, поэтому оно раскладывается на множители.
+    """
+    def atempo_chain(factor: float) -> str:
+        parts: list[str] = []
+        left = factor
+        while left > 2.0:
+            parts.append("atempo=2.0")
+            left /= 2.0
+        while left < 0.5:
+            parts.append("atempo=0.5")
+            left /= 0.5
+        parts.append(f"atempo={left:.6f}")
+        return ",".join(parts)
+
+    pieces: list[tuple[float, float, float]] = []
+    cursor = 0.0
+    for r in sorted(removals, key=lambda x: x.start_s):
+        if r.start_s > cursor + 0.02:
+            pieces.append((cursor, r.start_s, 1.0))
+        pieces.append((r.start_s, r.end_s, silence_speed))
+        cursor = max(cursor, r.end_s)
+    if cursor < duration - 0.02:
+        pieces.append((cursor, duration, 1.0))
+
+    chain = ""
+    for i, (a, b, f) in enumerate(pieces):
+        vf = f"setpts=PTS-STARTPTS/{f}" if f != 1.0 else "setpts=PTS-STARTPTS"
+        af = f"asetpts=PTS-STARTPTS,{atempo_chain(f)}" if f != 1.0 else "asetpts=PTS-STARTPTS"
+        chain += f"[0:v]trim=start={a}:end={b},{vf}[v{i}];[0:a]atrim=start={a}:end={b},{af}[a{i}];"
+    joins = "".join(f"[v{i}][a{i}]" for i in range(len(pieces)))
+    graph = f"{chain}{joins}concat=n={len(pieces)}:v=1:a=1[vc][ac]"
+    if abs(speed - 1.0) < 1e-6:
+        vout, aout = "[vc]", "[ac]"
+    else:
+        graph += f";[vc]setpts=PTS/{speed}[v];[ac]{atempo_chain(speed)}[a]"
+        vout, aout = "[v]", "[a]"
+    run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-filter_complex", graph,
+         "-map", vout, "-map", aout,
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dst)])
+
+
+def seam_contact_sheet(src: Path, removals: list["Removal"], out_dir: Path, limit: int = 8) -> list[Path]:
+    """ВИЗУАЛЬНАЯ проверка: кадр ДО и кадр ПОСЛЕ каждого шва, рядом.
+
+    Две машинные проверки отвечают на вопрос «не срезали ли речь». Они ничего не говорят о том,
+    ВИДНО ли склейку: человек в паузе успевает сменить позу, и звук при этом идеально чист.
+    Поэтому третья проверка — глазами, но по подготовленному материалу, а не отсматриванием
+    всего ролика.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    made: list[Path] = []
+    for n, r in enumerate(sorted(removals, key=lambda x: x.start_s)[:limit]):
+        before = max(0.0, r.start_s - 0.04)
+        after = r.end_s + 0.04
+        left = out_dir / f"seam{n:02d}-a.png"
+        right = out_dir / f"seam{n:02d}-b.png"
+        run(["ffmpeg", "-y", "-v", "error", "-ss", f"{before}", "-i", str(src), "-frames:v", "1",
+             "-vf", "scale=360:-2", str(left)])
+        run(["ffmpeg", "-y", "-v", "error", "-ss", f"{after}", "-i", str(src), "-frames:v", "1",
+             "-vf", "scale=360:-2", str(right)])
+        sheet = out_dir / f"seam{n:02d}.png"
+        run(["ffmpeg", "-y", "-v", "error", "-i", str(left), "-i", str(right),
+             "-filter_complex", "[0:v][1:v]hstack=inputs=2", str(sheet)])
+        left.unlink(missing_ok=True)
+        right.unlink(missing_ok=True)
+        made.append(sheet)
+    return made
+
+
 def render(src: Path, keeps, dst: Path, crf: int, speed: float) -> None:
     """Склейка, и только потом ускорение.
 
@@ -250,6 +329,12 @@ def main() -> None:
     ap.add_argument("--speed", type=float, default=1.3,
                     help="ускорение готового чистовика; применяется ПОСЛЕ реза, тон не меняется. "
                          "1.0 — не ускорять")
+    ap.add_argument("--silence", choices=["remove", "speed", "mark"], default="remove",
+                    help="что делать с паузой: вырезать, ускорить, или только разметить")
+    ap.add_argument("--silence-speed", type=float, default=6.0,
+                    help="во сколько раз ускорять паузу в режиме speed")
+    ap.add_argument("--seams", type=Path, default=None,
+                    help="куда положить кадры швов для проверки глазами (до и после каждого реза)")
     ap.add_argument("--dry-run", action="store_true", help="только план, без сборки")
     args = ap.parse_args()
 
@@ -303,6 +388,17 @@ def main() -> None:
         if not ok:
             raise SystemExit("отказ: вырезаемое содержит звук выше порога — это рез по речи")
 
+        if args.seams and removals:
+            sheets = seam_contact_sheet(src, removals, args.seams)
+            print(f"швы            {len(sheets)} кадров «до и после» в {args.seams}")
+
+        if args.silence == "mark":
+            print("режим mark: только разметка, ничего не собираю")
+            for r in sorted(removals, key=lambda x: x.start_s):
+                print(f"  {r.start_s:8.3f} - {r.end_s:8.3f}  пауза {r.pause_ms} мс"
+                      f"{' (граница предложения)' if r.at_sentence else ''}")
+            return
+
         if args.dry_run or not removals:
             if not removals:
                 print("резать нечего: пауз нужной длины нет")
@@ -328,9 +424,17 @@ def main() -> None:
 
         if not (0.5 <= args.speed <= 2.0):
             raise SystemExit("ускорение вне диапазона 0.5-2.0: atempo не примет его одним проходом")
-        render(src, keeps, dst, args.crf, args.speed)
+        if args.silence == "speed":
+            render_speed_silence(src, removals, duration, dst, args.crf, args.speed,
+                                 args.silence_speed)
+        else:
+            render(src, keeps, dst, args.crf, args.speed)
         got = duration_of(dst)
-        planned = (duration - removed_s) / args.speed
+        if args.silence == "speed":
+            kept_silence = sum((r.end_s - r.start_s) / args.silence_speed for r in removals)
+            planned = (duration - removed_s + kept_silence) / args.speed
+        else:
+            planned = (duration - removed_s) / args.speed
         if abs(args.speed - 1.0) > 1e-6:
             print(f"ускорение       {args.speed}x (после реза, высота тона не меняется)")
         print(f"собран          {dst} — {got:.2f} с "
