@@ -160,18 +160,53 @@ def keeps_from(removals: list[Removal], duration: float) -> list[tuple[float, fl
     return keeps
 
 
-def render(src: Path, keeps, dst: Path, crf: int) -> None:
-    """Склейка. Каждый шов попадает в измеренную тишину, поэтому звук НЕ кроссфейдится:
-    попытка сгладить шов кроссфейдом съедала речь на его краях."""
+def render(src: Path, keeps, dst: Path, crf: int, speed: float) -> None:
+    """Склейка, и только потом ускорение.
+
+    Каждый шов попадает в измеренную тишину, поэтому звук НЕ кроссфейдится: попытка сгладить шов
+    кроссфейдом съедала речь на его краях.
+
+    ПОРЯДОК ВАЖЕН. Резать надо на ИСХОДНОЙ скорости, а ускорять уже собранное. Если ускорить
+    сначала, все измеренные таймкоды разъедутся и аудит будет проверять не то, что вырезано.
+    Поэтому ускорение — последний фильтр в цепочке, после concat.
+
+    `atempo` растягивает время, не трогая высоту тона: голос не станет писклявым. Он принимает
+    0,5-2,0 за один проход, так что обычные 1,0-1,5 проходят одним фильтром.
+    """
     chain = "".join(
         f"[0:v]trim=start={a}:end={b},setpts=PTS-STARTPTS[v{i}];"
         f"[0:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS[a{i}];"
         for i, (a, b) in enumerate(keeps))
     joins = "".join(f"[v{i}][a{i}]" for i in range(len(keeps)))
-    run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-filter_complex",
-         f"{chain}{joins}concat=n={len(keeps)}:v=1:a=1[v][a]", "-map", "[v]", "-map", "[a]",
+    graph = f"{chain}{joins}concat=n={len(keeps)}:v=1:a=1[vc][ac]"
+    if abs(speed - 1.0) < 1e-6:
+        vout, aout = "[vc]", "[ac]"
+    else:
+        graph += f";[vc]setpts=PTS/{speed}[v];[ac]atempo={speed}[a]"
+        vout, aout = "[v]", "[a]"
+    run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-filter_complex", graph,
+         "-map", vout, "-map", aout,
          "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-pix_fmt", "yuv420p",
          "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dst)])
+
+
+def render_audio_only(src: Path, keeps, dst: Path) -> None:
+    """Собрать ТОЛЬКО звук чистовика, на исходной скорости.
+
+    Зачем отдельный проход: проверка речи должна идти по тому, что мы ВЫРЕЗАЛИ, а не по тому,
+    что потом растянули. Измерено на живом файле: при ускорении 1,3 совпадение падает с 0,8677
+    до 0,8478 и распознаватель «теряет» три слова, которых рез не касался — план реза в обоих
+    прогонах был буквально одинаковый. Быстрая речь просто хуже распознаётся.
+
+    Звуковая склейка стоит доли секунды против полного перекодирования видео, поэтому проверка
+    получается и честнее, и дешевле.
+    """
+    chain = "".join(f"[0:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS[a{i}];"
+                    for i, (a, b) in enumerate(keeps))
+    joins = "".join(f"[a{i}]" for i in range(len(keeps)))
+    run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-filter_complex",
+         f"{chain}{joins}concat=n={len(keeps)}:v=0:a=1[a]", "-map", "[a]",
+         "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dst)])
 
 
 def transcribe(wav: Path, key: str) -> list[dict]:
@@ -212,6 +247,9 @@ def main() -> None:
     # независимый сигнал, и ему положено быть мягче.
     ap.add_argument("--min-similarity", type=float, default=0.80,
                     help="порог совпадения при перепроверке речи; никогда не 1.0 — у распознавателя своя изменчивость")
+    ap.add_argument("--speed", type=float, default=1.3,
+                    help="ускорение готового чистовика; применяется ПОСЛЕ реза, тон не меняется. "
+                         "1.0 — не ускорять")
     ap.add_argument("--dry-run", action="store_true", help="только план, без сборки")
     args = ap.parse_args()
 
@@ -270,31 +308,35 @@ def main() -> None:
                 print("резать нечего: пауз нужной длины нет")
             return
 
-        render(src, keeps, dst, args.crf)
-        got = duration_of(dst)
-        print(f"собран          {dst} — {got:.2f} с "
-              f"(расхождение с планом {abs(got - (duration - removed_s)) * 1000:.0f} мс)")
+        # ПРОВЕРКА ВТОРАЯ: распознать результат заново — но ПО ЗВУКУ НА ИСХОДНОЙ СКОРОСТИ.
+        if key:
+            cut_wav = work / "cut.wav"
+            render_audio_only(src, keeps, cut_wav)
+            after = norm(" ".join(w["word"] for w in transcribe(cut_wav, key)))
+            expected = norm(" ".join(
+                w["word"] for w in words
+                if any(a <= float(w["start"]) and float(w["end"]) <= b for a, b in keeps)))
+            matcher = difflib.SequenceMatcher(a=expected, b=after, autojunk=False)
+            lost = [expected[i1:i2] for tag, i1, i2, _, _ in matcher.get_opcodes() if tag == "delete"]
+            flat = [x for group in lost for x in group]
+            print(f"проверка речи   совпадение {matcher.ratio():.4f} "
+                  f"(порог {args.min_similarity}), потеряно слов {len(flat)}")
+            if flat:
+                print(f"                потеряно: {' '.join(flat[:10])}")
+            if matcher.ratio() < args.min_similarity:
+                raise SystemExit("отказ: после реза речь разошлась с ожидаемой сильнее порога")
 
-        # ПРОВЕРКА ВТОРАЯ: распознать результат заново.
-        if not key:
-            return
-        out_wav = work / "result.wav"
-        run(["ffmpeg", "-y", "-v", "error", "-i", str(dst), "-vn", "-ac", "1", "-ar", "16000",
-             "-c:a", "pcm_s16le", str(out_wav)])
-        after = norm(" ".join(w["word"] for w in transcribe(out_wav, key)))
-        # сравнивать надо с тем, что ДОЛЖНО остаться, а не с полным исходником
-        expected = norm(" ".join(
-            w["word"] for w in words
-            if any(a <= float(w["start"]) and float(w["end"]) <= b for a, b in keeps)))
-        matcher = difflib.SequenceMatcher(a=expected, b=after, autojunk=False)
-        lost = [expected[i1:i2] for tag, i1, i2, _, _ in matcher.get_opcodes() if tag == "delete"]
-        flat = [x for group in lost for x in group]
-        print(f"проверка речи   совпадение {matcher.ratio():.4f} "
-              f"(порог {args.min_similarity}), потеряно слов {len(flat)}")
-        if flat:
-            print(f"                потеряно: {' '.join(flat[:10])}")
-        if matcher.ratio() < args.min_similarity:
-            raise SystemExit("отказ: после сборки речь разошлась с ожидаемой сильнее порога")
+        if not (0.5 <= args.speed <= 2.0):
+            raise SystemExit("ускорение вне диапазона 0.5-2.0: atempo не примет его одним проходом")
+        render(src, keeps, dst, args.crf, args.speed)
+        got = duration_of(dst)
+        planned = (duration - removed_s) / args.speed
+        if abs(args.speed - 1.0) > 1e-6:
+            print(f"ускорение       {args.speed}x (после реза, высота тона не меняется)")
+        print(f"собран          {dst} — {got:.2f} с "
+              f"(расхождение с планом {abs(got - planned) * 1000:.0f} мс)")
+        print(f"итого           {duration:.2f} с -> {got:.2f} с "
+              f"(короче на {100 * (1 - got / duration):.1f}%)")
 
 
 if __name__ == "__main__":
