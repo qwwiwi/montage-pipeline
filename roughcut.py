@@ -298,16 +298,30 @@ def render_audio_only(src: Path, keeps, dst: Path) -> None:
          "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dst)])
 
 
-def transcribe(wav: Path, key: str) -> list[dict]:
-    out = subprocess.run(
-        ["curl", "-sS", "--max-time", "600", RECOGNISER_URL,
-         "-H", f"Authorization: Bearer {key}",
-         "-F", f"model={RECOGNISER_MODEL}", "-F", "response_format=verbose_json",
-         "-F", "timestamp_granularities[]=word", "-F", f"file=@{wav}"],
-        capture_output=True, check=True).stdout
-    doc = json.loads(out)
+def recognise(wav: Path, key: str, model: str, url: str, extra: list[str]) -> dict:
+    """Запрос к распознавателю с ключом ЧЕРЕЗ STDIN, а не в аргументах команды.
+
+    Аргументы процесса видны всей машине: `ps aux` покажет строку запуска любому пользователю,
+    и ключ утечёт в вывод, в логи и в мониторинг — ничего взламывать не надо. Поэтому заголовок
+    с ключом передаётся curl через файл настроек на стандартном входе: его не видно ни в списке
+    процессов, ни на диске.
+
+    Имя файла в аргументах остаётся — в нём секрета нет.
+    """
+    config = f'header = "Authorization: Bearer {key}"\n'
+    proc = subprocess.run(
+        ["curl", "-sS", "--max-time", "600", "--config", "-", url, *extra],
+        input=config.encode(), capture_output=True, check=True)
+    doc = json.loads(proc.stdout)
     if "words" not in doc:
         raise SystemExit(f"распознаватель не вернул слова: {str(doc)[:200]}")
+    return doc
+
+
+def transcribe(wav: Path, key: str) -> list[dict]:
+    doc = recognise(wav, key, RECOGNISER_MODEL, RECOGNISER_URL,
+                    ["-F", f"model={RECOGNISER_MODEL}", "-F", "response_format=verbose_json",
+                     "-F", "timestamp_granularities[]=word", "-F", f"file=@{wav}"])
     return [w for w in doc["words"] if w.get("word", "").strip()]
 
 

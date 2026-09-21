@@ -63,12 +63,15 @@ def transcribe(video: Path, key: str) -> list[dict]:
         wav = Path(tmp) / "a.wav"
         run(["ffmpeg", "-y", "-v", "error", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000",
              "-c:a", "pcm_s16le", str(wav)])
-        out = subprocess.run(
-            ["curl", "-sS", "--max-time", "600", RECOGNISER_URL,
-             "-H", f"Authorization: Bearer {key}",
+        # Ключ идёт через стандартный вход, а не в аргументах: список процессов виден всей
+        # машине, и `ps aux` показал бы его любому пользователю. Взламывать ничего не нужно.
+        config = f'header = "Authorization: Bearer {key}"\n'
+        proc = subprocess.run(
+            ["curl", "-sS", "--max-time", "600", "--config", "-", RECOGNISER_URL,
              "-F", f"model={RECOGNISER_MODEL}", "-F", "response_format=verbose_json",
              "-F", "timestamp_granularities[]=word", "-F", f"file=@{wav}"],
-            capture_output=True, check=True).stdout
+            input=config.encode(), capture_output=True, check=True)
+        out = proc.stdout
     doc = json.loads(out)
     if "words" not in doc:
         raise SystemExit(f"распознаватель не вернул слова: {str(doc)[:200]}")
