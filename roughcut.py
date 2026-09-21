@@ -45,7 +45,12 @@ MIN_PAUSE_MS = 260      # короче - это дыхание, а не пауз
 GUARD_MID_MS = 90       # запас внутри фразы
 GUARD_SENTENCE_MS = 130 # запас на границе предложения
 MIN_REMOVE_MS = 60      # меньше не стоит склейки
-EDGE_KEEP_MS = 200      # тишина, оставляемая в самом начале и конце
+HEAD_KEEP_MS = 200      # тишина, оставляемая в самом начале
+# А в конце нужен ВОЗДУХ, и это не симметрично началу. С запасом 200 мс ролик обрывается сразу
+# после последнего слова и ощущается оборванным — владелец сказал «в конце сильно прерывается»,
+# и замер подтвердил: клип кончался ровно через 200 мс после речи. Начало можно резать плотно,
+# конец нельзя: зритель домысливает паузу после мысли, а её нет.
+TAIL_KEEP_MS = 600
 SENTENCE_END = (".", "!", "?", "…")
 
 RECOGNISER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -58,6 +63,9 @@ class Removal:
     end_s: float
     pause_ms: int
     at_sentence: bool
+    # Рез тишины или рез по решению модели. Разница не косметическая: от неё зависит, КАКОЙ
+    # ВОПРОС задаёт аудит. См. `audit` в main().
+    by_model: bool = False
 
 
 def run(args: list[str]) -> bytes:
@@ -133,9 +141,9 @@ def plan_removals(runs, words, duration: float) -> list[Removal]:
             continue
         at_sentence = False
         if a <= 0.15:
-            ra, rb = a, max(a, b - EDGE_KEEP_MS / 1000)
+            ra, rb = a, max(a, b - HEAD_KEEP_MS / 1000)
         elif b >= duration - 0.15:
-            ra, rb = min(b, a + EDGE_KEEP_MS / 1000), b
+            ra, rb = min(b, a + TAIL_KEEP_MS / 1000), b
         else:
             prev = max((w for w in words if float(w["end"]) <= a + 0.10),
                        key=lambda w: float(w["end"]), default=None)
@@ -195,7 +203,9 @@ def render_speed_silence(src: Path, removals: list["Removal"], duration: float, 
 
     chain = ""
     for i, (a, b, f) in enumerate(pieces):
-        vf = f"setpts=PTS-STARTPTS/{f}" if f != 1.0 else "setpts=PTS-STARTPTS"
+        # СКОБКИ ОБЯЗАТЕЛЬНЫ. `setpts=PTS-STARTPTS/6` разбирается как `PTS - (STARTPTS/6)`,
+        # то есть таймлайн не сжимается, а разъезжается: первый прогон дал 1967 секунд вместо 71.
+        vf = f"setpts=(PTS-STARTPTS)/{f}" if f != 1.0 else "setpts=PTS-STARTPTS"
         af = f"asetpts=PTS-STARTPTS,{atempo_chain(f)}" if f != 1.0 else "asetpts=PTS-STARTPTS"
         chain += f"[0:v]trim=start={a}:end={b},{vf}[v{i}];[0:a]atrim=start={a}:end={b},{af}[a{i}];"
     joins = "".join(f"[v{i}][a{i}]" for i in range(len(pieces)))
@@ -329,6 +339,10 @@ def main() -> None:
     ap.add_argument("--speed", type=float, default=1.3,
                     help="ускорение готового чистовика; применяется ПОСЛЕ реза, тон не меняется. "
                          "1.0 — не ускорять")
+    ap.add_argument("--drop", action="append", default=[], metavar="ОТ-ДО",
+                    help="убрать отрезок целиком, в секундах: --drop 60.8-62.8. "
+                         "Это ВХОД ДЛЯ РЕШЕНИЯ МОДЕЛИ: дубли и неудачные заходы выбирает она, "
+                         "код только исполняет и проверяет. Можно повторять.")
     ap.add_argument("--silence", choices=["remove", "speed", "mark"], default="remove",
                     help="что делать с паузой: вырезать, ускорить, или только разметить")
     ap.add_argument("--silence-speed", type=float, default=6.0,
@@ -364,6 +378,39 @@ def main() -> None:
                   "проверку речи пропускаю", file=sys.stderr)
 
         removals = plan_removals(runs, words, duration)
+
+        # Решение модели: отрезки, которые она велела выбросить целиком. Границы, названные по
+        # тексту, СНАПЯТСЯ В ИЗМЕРЕННУЮ ТИШИНУ — модель не режет по живому даже когда просит.
+        for spec in args.drop:
+            try:
+                a_s, b_s = spec.split("-", 1)
+                a, b = float(a_s), float(b_s)
+            except ValueError:
+                raise SystemExit(f"не разобрал отрезок {spec!r}, нужен вид 60.8-62.8")
+            snapped = []
+            for t, prefer_late in ((a, True), (b, False)):
+                inside = [(x, y) for x, y in runs if x <= t <= y]
+                if inside:
+                    x, y = inside[0]
+                    snapped.append(min(y - 0.08, max(x + 0.08, t)))
+                    continue
+                near = sorted(runs, key=lambda r: min(abs(r[0] - t), abs(r[1] - t)))
+                placed = None
+                for x, y in near[:3]:
+                    if min(abs(x - t), abs(y - t)) > 0.5 or (y - x) < 0.18:
+                        continue
+                    placed = (y - 0.08) if prefer_late else (x + 0.08)
+                    break
+                if placed is None:
+                    raise SystemExit(
+                        f"ОТКАЗ: у границы {t:.2f} нет тишины в пределах 500 мс — "
+                        f"резать там значит резать по слову")
+                snapped.append(placed)
+            removals.append(Removal(round(snapped[0], 3), round(snapped[1], 3),
+                                    round((snapped[1] - snapped[0]) * 1000), False,
+                                    by_model=True))
+            print(f"решение модели  {a:.2f}-{b:.2f} -> снаплено в тишину "
+                  f"{snapped[0]:.3f}-{snapped[1]:.3f}")
         keeps = keeps_from(removals, duration)
         removed_s = sum(r.end_s - r.start_s for r in removals)
 
@@ -376,17 +423,40 @@ def main() -> None:
         print(f"станет          {duration - removed_s:.2f} с "
               f"(сжатие {100 * removed_s / duration:.1f}%)")
 
-        # ПРОВЕРКА ПЕРВАЯ: измерение. Внутри вырезанного не должно быть ничего слышимого.
-        worst = -120.0
+        # ПРОВЕРКА ПЕРВАЯ, и она задаёт РАЗНЫЕ вопросы двум видам реза.
+        #
+        # Эта разница стоила отказа на ровном месте: аудит проверял нутро КАЖДОГО выреза и
+        # завалил рез по решению модели с превышением +12,3 дБ. Дефекта не было — вопрос был не
+        # тот. В вырезанном дубле речь находится НАМЕРЕННО.
+        #
+        #   рез тишины  — внутри не должно быть ничего слышимого. Это всё утверждение.
+        #   рез модели  — внутри речь по замыслу; проверять надо ОБА СТЫКА, они обязаны
+        #                 попадать в тишину, иначе склейка рубит слово.
+        seam = max(1, int(0.06 / hop))
+
+        def loudest(i0: int, i1: int) -> float:
+            return max(env[max(0, i0):max(1, i1)] or [-120.0])
+
+        worst_silence, worst_seam = -120.0, -120.0
         for r in removals:
             i0, i1 = int(r.start_s / hop), max(int(r.start_s / hop) + 1, int(r.end_s / hop))
-            worst = max(worst, max(env[i0:i1] or [-120.0]))
-        ok = worst < floor
-        print(f"аудит тишины    {'чисто' if ok else 'ПРОВАЛ'} "
-              f"(самый громкий сэмпл внутри вырезанного {worst:.1f} дБ, "
-              f"{worst - floor:+.1f} к порогу)")
-        if not ok:
-            raise SystemExit("отказ: вырезаемое содержит звук выше порога — это рез по речи")
+            if r.by_model:
+                worst_seam = max(worst_seam, loudest(i0 - seam, i0 + seam),
+                                 loudest(i1 - seam, i1 + seam))
+            else:
+                worst_silence = max(worst_silence, loudest(i0, i1))
+        ok_silence, ok_seam = worst_silence < floor, worst_seam < floor
+        print(f"аудит тишины    {'чисто' if ok_silence else 'ПРОВАЛ'} "
+              f"(громчайший сэмпл внутри вырезанного {worst_silence:.1f} дБ, "
+              f"{worst_silence - floor:+.1f} к порогу)")
+        if any(r.by_model for r in removals):
+            print(f"стыки модели    {'чисто' if ok_seam else 'ПРОВАЛ'} "
+                  f"(громчайший сэмпл на стыке {worst_seam:.1f} дБ, "
+                  f"{worst_seam - floor:+.1f} к порогу)")
+        if not ok_silence:
+            raise SystemExit("отказ: вырезаемая ТИШИНА содержит звук выше порога — это рез по речи")
+        if not ok_seam:
+            raise SystemExit("отказ: стык реза модели попадает не в тишину — склейка рубит слово")
 
         if args.seams and removals:
             sheets = seam_contact_sheet(src, removals, args.seams)
