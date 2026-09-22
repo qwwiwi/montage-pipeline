@@ -307,6 +307,55 @@ cp -r montage-pipeline/skills/montage-pipeline ~/.claude/skills/
 
 В новой сессии скажите агенту «смонтируй рилс из дубль.mp4» — скилл подтянется сам.
 
+Второй скилл — [`skills/montage-visual/`](skills/montage-visual/SKILL.md): второй заход,
+визуализация поверх замороженного чистовика в HyperFrames (раскладка, безопасные зоны Reels,
+субтитры, хук, панели шагов, призыв, источники UI-компонентов и логотипов).
+
+```bash
+cp -r montage-pipeline/skills/montage-visual ~/.claude/skills/
+```
+
+---
+
+## Второй заход: визуализация и безопасные зоны Reels
+
+Раскладка «экран сверху, спикер снизу»: панель шага (номер, прогресс, заголовок, визуальный блок с
+логотипами), спикер во всю ширину без уменьшения, субтитры на шве. Instagram кладёт поверх ролика
+свой интерфейс — всё важное держится в безопасной полосе.
+
+![Зоны Instagram Reels на раскладке: слева с разметкой, справа как увидит зритель](docs/img/reels-safe-zones.jpg)
+
+| Зона (y на кадре 1080×1920) | Что там |
+|---|---|
+| 0–115 (6%) | шапка Reels — только фон |
+| 115–1248 | безопасно: текст, логотипы, лицо |
+| 1248–1520 | свободно, только если подпись к посту короткая |
+| 1520–1920 | интерфейс Instagram всегда: ник, подпись, звук |
+| справа ≈ x 950–1080, y 1080–1720 | колонка кнопок (примерно — сверять по скриншоту) |
+
+Как выбиралась раскладка — четыре варианта на одном кадре, выбран первый:
+
+![Четыре варианта раскладки](docs/img/split-layouts.jpg)
+
+### Дополнительные репозитории
+
+| Что | Репозиторий | Лицензия |
+|---|---|---|
+| рендер HTML → видео, каталог 380+ блоков (чат Claude, терминал, уведомления, заметки, графики, схемы) | [heygen-com/hyperframes](https://github.com/heygen-com/hyperframes) | Apache-2.0 |
+| ящик в стиле Gmail (пример Mail), задачи, дашборды | [shadcn-ui/ui](https://github.com/shadcn-ui/ui) | MIT |
+| календарь, вид дня | [lramos33/big-calendar](https://github.com/lramos33/big-calendar) | MIT |
+| финансы: KPI, таблицы, графики | [tremorlabs/tremor](https://github.com/tremorlabs/tremor) | Apache-2.0 |
+| граф систем | [xyflow/xyflow](https://github.com/xyflow/xyflow) | MIT |
+| чат-интерфейсы | [vercel/ai-elements](https://github.com/vercel/ai-elements), [assistant-ui/assistant-ui](https://github.com/assistant-ui/assistant-ui) | Apache-2.0 / MIT |
+| логотипы брендов, цветные и моно | [glincker/thesvg](https://github.com/glincker/thesvg) | MIT |
+| логотипы брендов, цветные | [gilbarbara/logos](https://github.com/gilbarbara/logos) | CC0 |
+| логотипы, одноцветные | [simple-icons/simple-icons](https://github.com/simple-icons/simple-icons) | CC0 (у части иконок своя) |
+| шрифты с кириллицей | [Golos Text](https://github.com/google/fonts/tree/main/ofl/golostext), [Playfair Display](https://github.com/google/fonts/tree/main/ofl/playfairdisplay), [PT Serif](https://github.com/google/fonts/tree/main/ofl/ptserif) | OFL |
+
+Приложения из shadcn / Tremor собираются заранее в статический HTML + CSS: React в композицию не
+попадает, вся анимация — GSAP. Лицензия файла логотипа — только авторское право на SVG; товарный
+знак ставится, чтобы обозначить сервис, без намёка на партнёрство.
+
 ---
 
 ## Грабли, на которые мы наступили
@@ -332,8 +381,9 @@ cp -r montage-pipeline/skills/montage-pipeline ~/.claude/skills/
 
 ## Второй заход: оформление, и чем его делать на открытом стеке
 
-Кода второго захода здесь пока нет — он строится поверх замороженного чистовика. Но состав и
-правовая разведка уже сделаны, и это та часть, где чаще всего наступают на мину.
+Субтитры второго захода — `captions.py`; оформление целиком (хук, панели, призыв) — HyperFrames по
+скиллу `montage-visual`. Ниже — состав и правовая разведка: та часть, где чаще всего наступают на
+мину.
 
 **Правило, из которого всё вытекает:** ни одного закрытого сервиса в цепочке рендера. Всё, что
 стоит на сервере, — свободная программа либо модель с открытыми весами, разрешённая в
